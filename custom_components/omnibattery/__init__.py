@@ -828,6 +828,7 @@ class ChargeDischargeController:
         # Stale sensor detection
         self._last_sensor_report_time = None    # datetime of last real sensor publication (HA last_reported)
         self._last_valid_meter_publication = None  # same clock, but read every cycle for health
+        self._meter_wait_since = None           # utc time liveness began waiting for a first valid reading
         self._last_sensor_cadence_time = None   # latest publication consumed by the cadence detector
         self._last_control_sample_value = None  # last transformed value consumed by P/D
         self._control_sample_is_new = True      # result of the current control-loop sample
@@ -837,8 +838,9 @@ class ChargeDischargeController:
         self._control_lock = asyncio.Lock()     # serialize control cycle across timer + sensor-event triggers
         self._grid_at_min_soc_last_ts = None     # last accumulation timestamp for grid-at-min-soc kWh integration
         self._slow_sensor_issue_created = False  # slow-sensor repair currently raised
-        self._dead_sensor_issue_created = False  # dead-sensor repair currently raised
+        self._dead_sensor_issue_created = None   # dead-sensor repair raised (None: not checked yet this run)
         self._main_sensor_dead = False          # meter silent past MAIN_SENSOR_DEAD_S
+        self._main_sensor_never_reported = False  # dead without a single valid reading in this run
         self._dead_meter_fallback_engaged = False  # automatic batteries stopped for it
         self._slow_sensor_intervals = 0         # consecutive slow sensor intervals
         self._fast_sensor_intervals = 0         # consecutive fast intervals used to clear the repair
@@ -1381,6 +1383,7 @@ class ChargeDischargeController:
         self._grid_filter_ema = None
         self._last_sensor_report_time = None
         self._last_valid_meter_publication = None
+        self._meter_wait_since = None
         self._last_sensor_cadence_time = None
         self._last_control_sample_value = None
         self._control_sample_is_new = True
@@ -8829,7 +8832,13 @@ class ChargeDischargeController:
           whose inputs stopped moving. Nothing is logged at all, because from
           the state machine's point of view the entity is perfectly healthy.
 
-        In both cases the meter's own last publication stops advancing. Past
+        In both cases the meter's own last publication stops advancing. A meter
+        that has not published a usable reading at all in this run has no
+        publication to age, so its age counts from when this check started
+        waiting for one, once Home Assistant has finished starting. A crash
+        skips the unload that idles the batteries, and most brands hold the
+        last command on their own, so without this a meter that never comes
+        back would leave that command running with no repair raised. Past
         MAX_SENSOR_STALE_S the stale safety recalculation zeroes the P scale and
         the derivative, so the loop holds its last command; past
         MAIN_SENSOR_DEAD_S this check sets ``_main_sensor_dead`` and
@@ -8847,8 +8856,20 @@ class ChargeDischargeController:
         issue_id = f"dead_main_sensor_{self.config_entry.entry_id}"
 
         report_time = self._live_sensor_report_time()
-        # None means the meter has never published a usable reading in this run:
-        # a restart or an entity not set up yet, not a fault.
+        waiting = report_time is None
+        if waiting:
+            # Never a usable reading in this run. While Home Assistant is still
+            # starting, the integration behind the meter may simply not be set
+            # up yet; after that, the wait itself is the age. Once started it
+            # keeps counting, so a shutdown cannot release the fallback.
+            if (
+                self._meter_wait_since is None
+                and self.hass.state == CoreState.running
+            ):
+                self._meter_wait_since = (
+                    now if isinstance(now, datetime) else dt_util.utcnow()
+                )
+            report_time = self._meter_wait_since
         age_s = (
             self._sensor_age_seconds(report_time, now)
             if report_time is not None
@@ -8857,13 +8878,17 @@ class ChargeDischargeController:
 
         if age_s < MAIN_SENSOR_DEAD_S:
             self._main_sensor_dead = False
-            if self._dead_sensor_issue_created:
+            # Not known yet on the first check: the issue is persistent, so one
+            # raised before a restart is restored as active, and only this check
+            # would ever clear it.
+            if self._dead_sensor_issue_created is not False:
                 self._dead_sensor_issue_created = False
                 ir.async_delete_issue(self.hass, DOMAIN, issue_id)
             return
 
         self._main_sensor_dead = True
-        if self._last_valid_meter_publication is None:
+        self._main_sensor_never_reported = waiting
+        if self._last_valid_meter_publication is None and not waiting:
             # Pin the age to the tracked read time: the fallback clears that
             # timestamp, and without a high-water mark the age would collapse
             # to 0 and release the fallback the very next cycle.
@@ -8872,8 +8897,19 @@ class ChargeDischargeController:
             return
         self._dead_sensor_issue_created = True
         # Raised ahead of the fallback in the same cycle, so previous_power is
-        # still the command that ran blind. The warning log belongs to the
+        # still the command that ran blind. Without a reading in this run there
+        # is no such command to name: what may still be running is whatever the
+        # battery was told before the restart. The warning log belongs to the
         # fallback, which is what actually acts on it.
+        placeholders = {
+            "sensor": self.consumption_sensor,
+            "minutes": f"{age_s / 60:.0f}",
+        }
+        if waiting:
+            translation_key = "dead_main_sensor_since_start"
+        else:
+            translation_key = "dead_main_sensor"
+            placeholders["power"] = f"{abs(self.previous_power):.0f}"
         ir.async_create_issue(
             self.hass,
             DOMAIN,
@@ -8882,12 +8918,8 @@ class ChargeDischargeController:
             is_persistent=True,
             issue_domain=DOMAIN,
             severity=ir.IssueSeverity.WARNING,
-            translation_key="dead_main_sensor",
-            translation_placeholders={
-                "sensor": self.consumption_sensor,
-                "minutes": f"{age_s / 60:.0f}",
-                "power": f"{abs(self.previous_power):.0f}",
-            },
+            translation_key=translation_key,
+            translation_placeholders=placeholders,
         )
 
     async def _apply_dead_meter_fallback(self) -> bool:
@@ -8924,11 +8956,20 @@ class ChargeDischargeController:
 
         if not self._dead_meter_fallback_engaged:
             self._dead_meter_fallback_engaged = True
-            _LOGGER.warning(
-                "Grid sensor %s has not published for over %.0f minutes - stopping "
-                "automatic battery control (command was %.0fW) until it reports again",
-                self.consumption_sensor, MAIN_SENSOR_DEAD_S / 60, self.previous_power,
-            )
+            if self._main_sensor_never_reported:
+                _LOGGER.warning(
+                    "Grid sensor %s has not published a valid reading in the %.0f "
+                    "minutes since Home Assistant started - stopping automatic "
+                    "battery control, in case a battery still runs a command from "
+                    "before the restart, until it reports",
+                    self.consumption_sensor, MAIN_SENSOR_DEAD_S / 60,
+                )
+            else:
+                _LOGGER.warning(
+                    "Grid sensor %s has not published for over %.0f minutes - stopping "
+                    "automatic battery control (command was %.0fW) until it reports again",
+                    self.consumption_sensor, MAIN_SENSOR_DEAD_S / 60, self.previous_power,
+                )
             if self.grid_charging_active:
                 self._clear_predictive_runtime("dead_meter")
             self.error_integral = 0.0

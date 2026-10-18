@@ -5,8 +5,9 @@ meter that still speaks. A meter that goes completely silent produces no further
 publications and never reaches it; without a time limit the loop would hold its
 last command for as long as the silence lasts (issue #452). These tests pin the
 lifecycle of the issue that makes that visible, including the
-frozen-on-a-valid-value flavour, and the fallback that stops automatic control
-once the meter counts as dead and hands it back when the meter returns.
+frozen-on-a-valid-value flavour and a meter that never publishes after a
+restart, and the fallback that stops automatic control once the meter counts
+as dead and hands it back when the meter returns.
 
 ``_check_main_sensor_liveness`` only touches ``self.hass``, ``self.config_entry``,
 ``self.consumption_sensor``, ``self.previous_power`` and its own flag, so it is
@@ -20,11 +21,14 @@ tracked timestamp aging while the meter keeps publishing.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from homeassistant.core import CoreState
 
 import custom_components.omnibattery as omnibattery_init
 from custom_components.omnibattery import ChargeDischargeController
@@ -64,12 +68,12 @@ class _FakeStates:
         return self._state
 
 
-def _state(value="1234.0", reported_s_ago=0.0):
+def _state(value="1234.0", reported_s_ago=0.0, reported_at=None):
     """Meter state as Home Assistant exposes it, with its own publication clock."""
     return SimpleNamespace(
         state=value,
         attributes={"unit_of_measurement": "W"},
-        last_reported=NOW - timedelta(seconds=reported_s_ago),
+        last_reported=reported_at or NOW - timedelta(seconds=reported_s_ago),
     )
 
 
@@ -90,7 +94,7 @@ def _ctrl(
     elif state is None:
         state = _state(reported_s_ago=silent_for_s or 0.0)
     return SimpleNamespace(
-        hass=SimpleNamespace(states=_FakeStates(state)),
+        hass=SimpleNamespace(states=_FakeStates(state), state=CoreState.running),
         config_entry=SimpleNamespace(entry_id="abc123"),
         consumption_sensor=sensor,
         previous_power=previous_power,
@@ -101,6 +105,7 @@ def _ctrl(
             None if silent_for_s is None else NOW - timedelta(seconds=silent_for_s)
         ),
         _last_valid_meter_publication=None,
+        _meter_wait_since=None,
         _dead_sensor_issue_created=False,
     )
 
@@ -201,17 +206,149 @@ def test_a_brief_unavailable_blip_is_not_minutes_of_silence(issues):
     assert issues.created == []
 
 
-def test_a_meter_unavailable_since_boot_is_a_restart_not_a_fault(issues):
-    """Never a usable reading in this run: nothing to age, so nothing to report.
+# --- A meter that never publishes in this run ---------------------------------
 
-    The entity exists but has published only ``unavailable`` since the restart,
-    so both the high-water mark and the tracked read time are still None. The
-    missing-sensor repair next door is what names a meter that never arrives.
+
+@pytest.mark.parametrize(
+    "state", [_state(value="unavailable"), _NO_STATE], ids=["unavailable", "absent"]
+)
+def test_a_meter_silent_since_boot_ages_from_the_wait(issues, state):
+    """No reading to age, so the wait for the first one is the age.
+
+    A crash skips the unload that idles the batteries, and most brands hold the
+    last command themselves. Without an age the repair and the fallback could
+    never trip, and that command would run until an SOC limit. The entity
+    existing but ``unavailable`` is invisible to the missing-sensor repair,
+    which only names an entity that is absent.
     """
-    ctrl = _ctrl(None, state=_state(value="unavailable"))
+    ctrl = _ctrl(None, state=state)
+    _check(ctrl, NOW)
+    _check(ctrl, NOW + timedelta(seconds=MAIN_SENSOR_DEAD_S - 1))
+    assert ctrl._main_sensor_dead is False
+    assert issues.created == []
+
+    _check(ctrl, NOW + timedelta(seconds=MAIN_SENSOR_DEAD_S + 1))
+    assert ctrl._main_sensor_dead is True
+    assert ctrl._main_sensor_never_reported is True
+    assert len(issues.created) == 1
+    # No command was sent in this run, so the text cannot name one.
+    issue = issues.created[0][1]
+    assert issue["translation_key"] == "dead_main_sensor_since_start"
+    assert issue["translation_placeholders"] == {
+        "sensor": "sensor.grid_power", "minutes": "5",
+    }
+    # The wait is not a publication: the high-water mark stays empty.
+    assert ctrl._last_valid_meter_publication is None
+
+
+def test_a_meter_that_reported_once_keeps_the_original_text(issues):
+    ctrl = _ctrl(MAIN_SENSOR_DEAD_S + 60)
     _check(ctrl)
 
-    assert issues.created == []
+    issue = issues.created[0][1]
+    assert ctrl._main_sensor_never_reported is False
+    assert issue["translation_key"] == "dead_main_sensor"
+    assert issue["translation_placeholders"]["power"] == "1500"
+
+
+def test_the_since_start_text_exists_in_every_language():
+    root = Path(omnibattery_init.__file__).parent
+    files = [root / "strings.json", *sorted((root / "translations").glob("*.json"))]
+    assert len(files) == 7
+    for path in files:
+        issues_text = json.loads(path.read_text(encoding="utf-8"))["issues"]
+        text = issues_text["dead_main_sensor_since_start"]["description"]
+        assert "{sensor}" in text and "{minutes}" in text, path.name
+        assert "{power}" not in text, path.name
+        assert "0W" in text and "0 W" not in text, path.name
+
+
+# --- A Repairs issue left over from before the restart ------------------------
+
+
+def test_a_healthy_meter_clears_an_issue_left_from_before_the_restart(issues):
+    """The issue is persistent, so HA restores it as active after a restart.
+
+    The controller starts not knowing whether one is showing; the first check
+    on a live meter clears it, and later checks do not repeat the delete.
+    """
+    ctrl = _ctrl(1.0)
+    ctrl._dead_sensor_issue_created = None
+    _check(ctrl)
+    _check(ctrl)
+
+    assert issues.deleted == ["dead_main_sensor_abc123"]
+    assert ctrl._dead_sensor_issue_created is False
+
+
+def test_a_meter_still_dead_after_the_restart_reraises_the_issue(issues):
+    """Not knowing must not count as raised: the text may be from a past run."""
+    ctrl = _ctrl(MAIN_SENSOR_DEAD_S + 60)
+    ctrl._dead_sensor_issue_created = None
+    _check(ctrl)
+
+    assert len(issues.created) == 1
+    assert issues.deleted == []
+
+
+def test_the_wait_starts_once_home_assistant_has_started(issues):
+    """During startup the meter's integration may not be set up yet."""
+    ctrl = _ctrl(None, state=_state(value="unavailable"))
+    ctrl.hass.state = CoreState.starting
+    _check(ctrl, NOW)
+    _check(ctrl, NOW + timedelta(seconds=MAIN_SENSOR_DEAD_S + 60))
+    assert ctrl._main_sensor_dead is False
+    assert ctrl._meter_wait_since is None
+
+    started = NOW + timedelta(seconds=MAIN_SENSOR_DEAD_S + 60)
+    ctrl.hass.state = CoreState.running
+    _check(ctrl, started)
+    _check(ctrl, started + timedelta(seconds=MAIN_SENSOR_DEAD_S - 1))
+    assert ctrl._main_sensor_dead is False
+
+    _check(ctrl, started + timedelta(seconds=MAIN_SENSOR_DEAD_S + 1))
+    assert ctrl._main_sensor_dead is True
+
+
+def test_a_shutdown_does_not_release_a_meter_that_never_reported(issues):
+    """Once the wait has started it keeps counting whatever state HA is in."""
+    ctrl = _ctrl(None, state=_state(value="unavailable"))
+    _check(ctrl, NOW)
+    dead_at = NOW + timedelta(seconds=MAIN_SENSOR_DEAD_S + 1)
+    _check(ctrl, dead_at)
+    assert ctrl._main_sensor_dead is True
+
+    ctrl.hass.state = CoreState.stopping
+    _check(ctrl, dead_at + timedelta(seconds=2))
+    assert ctrl._main_sensor_dead is True
+    assert issues.deleted == []
+
+
+def test_a_first_reading_ends_the_wait(issues):
+    ctrl = _ctrl(None, state=_state(value="unavailable"))
+    _check(ctrl, NOW)
+    dead_at = NOW + timedelta(seconds=MAIN_SENSOR_DEAD_S + 1)
+    _check(ctrl, dead_at)
+    assert ctrl._main_sensor_dead is True
+
+    ctrl.hass.states._state = _state(value="900", reported_at=dead_at)
+    _check(ctrl, dead_at)
+    assert ctrl._main_sensor_dead is False
+    assert issues.deleted == ["dead_main_sensor_abc123"]
+
+
+def test_selecting_another_meter_restarts_the_wait(issues):
+    """A newly selected meter gets its own grace, as it would after a restart."""
+    ctrl = _ctrl(None, state=_state(value="unavailable"))
+    _check(ctrl, NOW)
+    switched = NOW + timedelta(seconds=MAIN_SENSOR_DEAD_S - 60)
+    ChargeDischargeController._reset_consumption_source_tracking(ctrl)
+    _check(ctrl, switched)
+
+    _check(ctrl, NOW + timedelta(seconds=MAIN_SENSOR_DEAD_S + 1))
+    assert ctrl._main_sensor_dead is False
+    _check(ctrl, switched + timedelta(seconds=MAIN_SENSOR_DEAD_S + 1))
+    assert ctrl._main_sensor_dead is True
 
 
 def test_an_unavailable_meter_is_still_dead(issues):
@@ -285,6 +422,7 @@ def _fallback_ctrl(*, dead=True, grid_charging_active=False):
         coordinators=batteries,
         consumption_sensor="sensor.grid_power",
         _main_sensor_dead=dead,
+        _main_sensor_never_reported=False,
         _dead_meter_fallback_engaged=False,
         grid_charging_active=grid_charging_active,
         previous_power=-1500.0,
@@ -375,6 +513,22 @@ def test_the_stop_is_reasserted_but_announced_once(caplog):
     assert "-1500W" in warnings[0].getMessage()
 
 
+def test_a_meter_that_never_reported_is_announced_as_such(caplog):
+    """No command was sent in this run, so the log names the restart instead."""
+    ctrl, writes, _ = _fallback_ctrl()
+    ctrl._main_sensor_never_reported = True
+    ctrl.previous_power = 0
+    with caplog.at_level(logging.WARNING):
+        assert _fallback(ctrl) is True
+
+    assert writes == [("a", 0, 0), ("b", 0, 0)]
+    (warning,) = [
+        r.getMessage() for r in caplog.records if "stopping automatic" in r.getMessage()
+    ]
+    assert "since Home Assistant started" in warning
+    assert "command was" not in warning
+
+
 def test_a_dead_meter_releases_a_predictive_grid_charge():
     """Its import ceiling is regulated on the meter, so it cannot run blind."""
     ctrl, writes, cleared = _fallback_ctrl(grid_charging_active=True)
@@ -426,6 +580,8 @@ def _cycle_ctrl(state_holder, pd_calls, writes):
     ctrl.offgrid_mode_enabled = False
     ctrl.offgrid_power_sensor = None
     ctrl._last_valid_meter_publication = None
+    ctrl._meter_wait_since = None
+    ctrl.hass.state = CoreState.running
     ctrl._dead_sensor_issue_created = False
     ctrl._main_sensor_dead = False
     ctrl._dead_meter_fallback_engaged = False
@@ -498,6 +654,43 @@ def test_the_cycle_stops_on_a_dead_meter_and_resumes_on_recovery(
 
     # A fresh reading restarts through first-execution initialisation: the
     # command is rebuilt from the new reading, not from pre-outage state.
+    back_at = dead_at + timedelta(seconds=90)
+    state_holder["state"] = _meter(700, back_at)
+    asyncio.run(ctrl._run_control_cycle(now=back_at))
+    assert ctrl._main_sensor_dead is False
+    assert ctrl._dead_meter_fallback_engaged is False
+    assert issues.deleted == ["dead_main_sensor_control-sample"]
+    assert ctrl.first_execution is False
+    assert ctrl.previous_power == -700
+
+
+def test_the_cycle_stops_a_command_retained_from_before_a_crash(issues):
+    """The meter never publishes after a crash-restart: stop, then resume.
+
+    A crash skips the unload that idles the batteries, so the battery can still
+    be running the last command from before it. The controller never got a
+    reading in this run, yet must not leave that command running.
+    """
+    t0 = NOW
+    state_holder = {"state": _meter("unavailable", t0)}
+    pd_calls, writes = [], []
+    ctrl = _cycle_ctrl(state_holder, pd_calls, writes)
+    ctrl.first_execution = True
+    ctrl.previous_power = 0
+
+    asyncio.run(ctrl._run_control_cycle(now=t0 + timedelta(seconds=1)))
+    asyncio.run(ctrl._run_control_cycle(now=t0 + timedelta(seconds=120)))
+    assert ctrl._main_sensor_dead is False
+    assert writes == []
+
+    dead_at = t0 + timedelta(seconds=MAIN_SENSOR_DEAD_S + 5)
+    asyncio.run(ctrl._run_control_cycle(now=dead_at))
+    assert ctrl._main_sensor_dead is True
+    assert writes == [(0, 0)]
+    assert len(issues.created) == 1
+    assert issues.created[0][1]["translation_key"] == "dead_main_sensor_since_start"
+    assert pd_calls == []
+
     back_at = dead_at + timedelta(seconds=90)
     state_holder["state"] = _meter(700, back_at)
     asyncio.run(ctrl._run_control_cycle(now=back_at))

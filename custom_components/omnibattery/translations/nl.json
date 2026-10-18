@@ -24,6 +24,10 @@
       "title": "Netvermogenssensor publiceert niet meer",
       "description": "De ingestelde netsensor {sensor} heeft al {minutes} minuten geen meting gepubliceerd. Omnibattery kan zonder die meting niet regelen en heeft daarom de automatische regeling gestopt: elke batterij onder automatische regeling staat op 0W (het laatste commando was {power}W) en voorspellend laden van het net is gepauzeerd. Handmatige modus en handmatige tijdsloten blijven zoals ze zijn. De automatische regeling hervat vanzelf zodra {sensor} weer een geldige meting publiceert. Let op: een sensor die op een geldige waarde is vastgelopen ziet er in Home Assistant volkomen gezond uit. Controleer of {sensor} nog bijwerkt en of de integratie of bridge erachter niet is vastgelopen."
     },
+    "dead_main_sensor_since_start": {
+      "title": "Netvermogenssensor publiceert niet sinds de herstart",
+      "description": "De ingestelde netsensor {sensor} heeft in de {minutes} minuten sinds Home Assistant is gestart geen geldige meting gepubliceerd. Omnibattery kan zonder die meting niet regelen. Als Home Assistant niet netjes is afgesloten, kan een batterij nog het laatste commando van vóór de herstart uitvoeren. Omnibattery heeft daarom de automatische regeling gestopt: elke batterij onder automatische regeling staat op 0W en voorspellend laden van het net is gepauzeerd. Handmatige modus en handmatige tijdsloten blijven zoals ze zijn. De automatische regeling start vanzelf zodra {sensor} een geldige meting publiceert. Controleer of {sensor} bestaat en bijwerkt, en of de integratie of het apparaat erachter na de herstart weer werkt."
+    },
     "slow_main_sensor": {
       "title": "De netvermogenssensor werkt te langzaam bij",
       "description": "De geconfigureerde netsensor {sensor} werkt ongeveer elke {observed_interval} seconden bij. Intervallen van {warning_interval} seconden of meer zijn trager dan aanbevolen en kunnen de regelkwaliteit verminderen. Omnibattery volgt de laatste meting totdat deze ouder is dan {stale_limit} seconden. Gebruik een snellere sensor als u een nauwkeurigere realtime regeling nodig hebt."
