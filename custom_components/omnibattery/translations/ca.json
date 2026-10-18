@@ -22,7 +22,7 @@
     },
     "dead_main_sensor": {
       "title": "El sensor de potència de xarxa ha deixat de publicar",
-      "description": "El sensor de xarxa configurat {sensor} fa {minutes} minuts que no publica cap lectura. Omnibattery no pot regular sense ell, així que manté la seva darrera ordre de {power} W: passada la tolerància d'antiguitat, el controlador deixa d'integrar correccions noves en lloc d'actuar sobre una lectura que sap vella. Els límits de càrrega i descàrrega, els bloqueigs per SOC i la protecció trifàsica continuen aplicant-se, així que no és una fuga de control, però les bateries continuaran carregant o descarregant a aquesta potència fixa contra un consum que ningú no està llegint, fins que un límit de SOC les aturi. Tingues en compte que un sensor congelat en un valor vàlid sembla perfectament sa a Home Assistant: comprova que {sensor} continua actualitzant-se i que la integració o el pont que hi ha al darrere no s'ha encallat."
+      "description": "El sensor de xarxa configurat {sensor} fa {minutes} minuts que no publica cap lectura. Omnibattery no pot regular sense ell, així que ha aturat el control automàtic: cada bateria sota control automàtic queda a 0W (la darrera ordre era de {power}W) i la càrrega predictiva des de la xarxa està en pausa. El mode manual i les franges manuals es mantenen com estan. El control automàtic es reprèn sol tan bon punt {sensor} torni a publicar una lectura vàlida. Tingues en compte que un sensor congelat en un valor vàlid sembla perfectament sa a Home Assistant: comprova que {sensor} continua actualitzant-se i que la integració o el pont que hi ha al darrere no s'ha encallat."
     },
     "slow_main_sensor": {
       "title": "El sensor de potència de xarxa s'actualitza massa lentament",

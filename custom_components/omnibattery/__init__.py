@@ -838,6 +838,8 @@ class ChargeDischargeController:
         self._grid_at_min_soc_last_ts = None     # last accumulation timestamp for grid-at-min-soc kWh integration
         self._slow_sensor_issue_created = False  # slow-sensor repair currently raised
         self._dead_sensor_issue_created = False  # dead-sensor repair currently raised
+        self._main_sensor_dead = False          # meter silent past MAIN_SENSOR_DEAD_S
+        self._dead_meter_fallback_engaged = False  # automatic batteries stopped for it
         self._slow_sensor_intervals = 0         # consecutive slow sensor intervals
         self._fast_sensor_intervals = 0         # consecutive fast intervals used to clear the repair
 
@@ -8827,13 +8829,12 @@ class ChargeDischargeController:
           whose inputs stopped moving. Nothing is logged at all, because from
           the state machine's point of view the entity is perfectly healthy.
 
-        In both cases the meter's own last publication stops advancing and the
-        loop holds the last command indefinitely: past MAX_SENSOR_STALE_S the stale
-        safety recalculation zeroes the P scale and the derivative, so the
-        adjustment is exactly 0. The structural guards above still run, so this
-        is not a runaway - the exposure is bounded by the SOC blockers, not by
-        time, which on a multi-battery fleet is hours of exporting or importing
-        against a house whose load is no longer being read.
+        In both cases the meter's own last publication stops advancing. Past
+        MAX_SENSOR_STALE_S the stale safety recalculation zeroes the P scale and
+        the derivative, so the loop holds its last command; past
+        MAIN_SENSOR_DEAD_S this check sets ``_main_sensor_dead`` and
+        ``_apply_dead_meter_fallback`` stops automatic control, so the exposure
+        is bounded in time rather than only by the SOC blockers.
 
         Called before every early return in the cycle, for the same reason the
         other health checks are: manual mode, a block or a predictive handler
@@ -8841,6 +8842,7 @@ class ChargeDischargeController:
         never be cleared.
         """
         if not self.consumption_sensor:
+            self._main_sensor_dead = False
             return
         issue_id = f"dead_main_sensor_{self.config_entry.entry_id}"
 
@@ -8854,19 +8856,24 @@ class ChargeDischargeController:
         )
 
         if age_s < MAIN_SENSOR_DEAD_S:
+            self._main_sensor_dead = False
             if self._dead_sensor_issue_created:
                 self._dead_sensor_issue_created = False
                 ir.async_delete_issue(self.hass, DOMAIN, issue_id)
             return
 
+        self._main_sensor_dead = True
+        if self._last_valid_meter_publication is None:
+            # Pin the age to the tracked read time: the fallback clears that
+            # timestamp, and without a high-water mark the age would collapse
+            # to 0 and release the fallback the very next cycle.
+            self._last_valid_meter_publication = report_time
         if self._dead_sensor_issue_created:
             return
         self._dead_sensor_issue_created = True
-        _LOGGER.warning(
-            "Grid sensor %s has not published for %.0f minutes - holding the last "
-            "command of %.0fW until the SOC limits stop it",
-            self.consumption_sensor, age_s / 60, self.previous_power,
-        )
+        # Raised ahead of the fallback in the same cycle, so previous_power is
+        # still the command that ran blind. The warning log belongs to the
+        # fallback, which is what actually acts on it.
         ir.async_create_issue(
             self.hass,
             DOMAIN,
@@ -8882,6 +8889,73 @@ class ChargeDischargeController:
                 "power": f"{abs(self.previous_power):.0f}",
             },
         )
+
+    async def _apply_dead_meter_fallback(self) -> bool:
+        """Stop automatic control while the main grid sensor is dead.
+
+        ``_check_main_sensor_liveness`` decides; this acts. Holding the last
+        command against a house nobody is reading is bounded only by the SOC
+        blockers, so once the meter has been silent for MAIN_SENSOR_DEAD_S every
+        automatic battery goes to 0W and stays there until it publishes again.
+        An immediate stop rather than a ramp: the command has already run blind
+        for minutes, and the operation blocks stop the same way.
+
+        The caller places this after manual mode, manual slots and max-SOC
+        balancing, which are not driven by the meter, and before predictive
+        dispatch: a predictive grid charge regulates its import ceiling on the
+        meter too, so it is released rather than left charging blind.
+        ``_set_battery_power`` already skips batteries a user owns.
+
+        Entering resets the controller the way a restart would: no PD state,
+        filter or sample timestamp survives the outage, so the first reading
+        after recovery goes through the first-execution initialisation instead
+        of integrating a gap of minutes as one sample.
+
+        Returns True while the fallback owns the cycle.
+        """
+        if not self._main_sensor_dead:
+            if self._dead_meter_fallback_engaged:
+                self._dead_meter_fallback_engaged = False
+                _LOGGER.info(
+                    "Grid sensor %s is publishing again - resuming automatic control",
+                    self.consumption_sensor,
+                )
+            return False
+
+        if not self._dead_meter_fallback_engaged:
+            self._dead_meter_fallback_engaged = True
+            _LOGGER.warning(
+                "Grid sensor %s has not published for over %.0f minutes - stopping "
+                "automatic battery control (command was %.0fW) until it reports again",
+                self.consumption_sensor, MAIN_SENSOR_DEAD_S / 60, self.previous_power,
+            )
+            if self.grid_charging_active:
+                self._clear_predictive_runtime("dead_meter")
+            self.error_integral = 0.0
+            self.previous_error = 0.0
+            self.derivative_filtered = 0.0
+            self.sign_changes = 0
+            self.last_error_sign = 0
+            self.previous_sensor = None
+            self._zero_cross_since = None
+            self._clear_rate_limiter_state()
+            self._grid_filter_ema = None
+            self._last_sensor_report_time = None
+            self._last_control_sample_value = None
+            self._control_sample_is_new = True
+            self._stale_cycles = 0
+            self.first_execution = True
+
+        # Re-asserted every cycle: the bus-load skip makes repeats free, and a
+        # battery that was unreachable when the fallback engaged still gets it.
+        for coordinator in self.coordinators:
+            await self._set_battery_power(coordinator, 0, 0)
+        self.previous_power = 0
+        self.last_output_sign = 0
+        self._active_discharge_batteries = []
+        self._active_charge_batteries = []
+        self._phase_safety_pending = False
+        return True
 
     def _live_sensor_report_time(self):
         """Return when the meter itself last published, not when we last read it.
@@ -9077,6 +9151,11 @@ class ChargeDischargeController:
             self.sign_changes = 0
             self._active_discharge_batteries = []
             self._active_charge_batteries = []
+            return
+
+        # A dead meter stops automatic control before predictive dispatch, so a
+        # grid charge cannot keep importing against a ceiling nobody is reading.
+        if await self._apply_dead_meter_fallback():
             return
 
         # === Predictive Grid Charging Logic (mode dispatch) ===
